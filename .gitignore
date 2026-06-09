@@ -1,0 +1,6 @@
+build/
+*.wasm
+*.cwasm
+fizz-memory-api
+.almide/
+memory.jsonl

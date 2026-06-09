@@ -1,0 +1,7 @@
+[package]
+name = "fizz_memory_api"
+version = "0.1.0"
+description = "Fizz memory API — HTTP front that dispatches note/recall/search/wipe/users over a file-backed event log"
+
+[dependencies]
+fizz_protocol = { git = "https://github.com/Aid-On/fizz-protocol", tag = "v0.2.1" }

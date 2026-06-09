@@ -1,0 +1,56 @@
+import self as api
+import fizz_protocol.memory
+import list
+
+local fn ev(id: Int, uid: Int, content: String) -> memory.MemoryEvent = {
+  let empty_tags: List[String] = []
+  memory.MemoryEvent {
+    id: id, user_id: uid, session_id: none, role: memory.User,
+    content: content, ts: id, tags: empty_tags,
+  }
+}
+
+local fn content_of(o: Option[memory.MemoryEvent]) -> String =
+  match o { some(e) => e.content, none => "<none>" }
+
+test "route maps method+path to the operation" {
+  match api.route("POST", "/note") { Note => assert_eq(1,1), _ => assert_eq("note","x") }
+  match api.route("GET", "/recall") { Recall => assert_eq(1,1), _ => assert_eq("recall","x") }
+  match api.route("GET", "/search") { Search => assert_eq(1,1), _ => assert_eq("search","x") }
+  match api.route("POST", "/wipe") { Wipe => assert_eq(1,1), _ => assert_eq("wipe","x") }
+  match api.route("GET", "/users") { Users => assert_eq(1,1), _ => assert_eq("users","x") }
+  match api.route("GET", "/note") { NotFound => assert_eq(1,1), _ => assert_eq("nf","x") }
+  match api.route("DELETE", "/wipe") { NotFound => assert_eq(1,1), _ => assert_eq("nf","x") }
+}
+
+test "clean_path strips the query string" {
+  assert_eq(api.clean_path("/recall?user_id=7"), "/recall")
+  assert_eq(api.clean_path("/users"), "/users")
+}
+
+test "recent_of filters by user and keeps the last N" {
+  let all = [ev(1,1,"a"), ev(2,2,"x"), ev(3,1,"b"), ev(4,1,"c")]
+  let got = api.recent_of(all, 1, 2)
+  assert_eq(list.len(got), 2)
+  assert_eq(content_of(list.first(got)), "b")
+  assert_eq(content_of(list.last(got)), "c")
+}
+
+test "search matches content substrings; empty q matches nothing" {
+  let all = [ev(1,1,"猫が好き"), ev(2,1,"犬も好き"), ev(3,2,"猫カフェ")]
+  assert_eq(list.len(api.search(all, "猫")), 2)
+  assert_eq(list.len(api.search(all, "")), 0)
+}
+
+test "distinct_users lists each user once, in first-seen order" {
+  let all = [ev(1,7,"a"), ev(2,9,"b"), ev(3,7,"c"), ev(4,5,"d")]
+  let us = api.distinct_users(all)
+  assert_eq(list.len(us), 3)
+  assert_eq(list.first(us) ?? 0, 7)
+}
+
+test "next_id is max id + 1" {
+  let empty: List[memory.MemoryEvent] = []
+  assert_eq(api.next_id(empty), 1)
+  assert_eq(api.next_id([ev(3,1,"a"), ev(9,1,"b")]), 10)
+}

@@ -1,0 +1,68 @@
+// fizz_memory_api — memory 操作の HTTP ディスパッチ。
+//
+// 責務 (一行): HTTP リクエスト (method + path) を memory 操作に振り分け、
+// note/recall/search/wipe/users を 1 つのエンドポイント群として公開する。
+//
+// 実体のイベントログはディスク (l2 と同じ append-only JSONL) に持つので、
+// http.serve の (純粋な) ハンドラでもリクエストごとに read/append すれば状態を
+// 跨いで保てる。この mod はルート判定と検索/集計など純粋ロジックだけを持ち、
+// 実際の fs I/O と http 応答組み立ては main の責務。
+//
+// ルート:
+//   POST /note            本文に MemoryEvent → 追記 (id 採番)
+//   GET  /recall?user_id=N 該当ユーザの末尾イベント
+//   GET  /search?q=...     content に q を含むイベント
+//   POST /wipe             ログ消去
+//   GET  /users            出現した user_id 一覧
+
+import fizz_protocol.memory
+import list
+import string
+
+type Route =
+  | Note
+  | Recall
+  | Search
+  | Wipe
+  | Users
+  | NotFound
+
+fn route(method: String, path: String) -> Route =
+  if method == "POST" and path == "/note" then Note
+  else if method == "GET" and path == "/recall" then Recall
+  else if method == "GET" and path == "/search" then Search
+  else if method == "POST" and path == "/wipe" then Wipe
+  else if method == "GET" and path == "/users" then Users
+  else NotFound
+
+// クエリ文字列 (?...) を除いた path。
+fn clean_path(raw: String) -> String =
+  match list.first(string.split(raw, "?")) {
+    some(p) => p,
+    none    => raw,
+  }
+
+// user_id 一致のみ抽出し、末尾 limit 件 (古い順) を返す。limit<=0 で全件。
+fn recent_of(events: List[memory.MemoryEvent], user_id: Int, limit: Int) -> List[memory.MemoryEvent] = {
+  let mine = list.filter(events, (e) => e.user_id == user_id)
+  let n = list.len(mine)
+  if limit <= 0 then mine
+  else if n <= limit then mine
+  else list.drop(mine, n - limit)
+}
+
+// content に q を含むイベント (q 空なら空)。
+fn search(events: List[memory.MemoryEvent], q: String) -> List[memory.MemoryEvent] =
+  if q == "" then list.filter(events, (e) => false)
+  else list.filter(events, (e) => string.contains(e.content, q))
+
+// 出現した user_id の重複なしリスト (出現順)。
+fn distinct_users(events: List[memory.MemoryEvent]) -> List[Int] = {
+  let seed: List[Int] = []
+  list.fold(events, seed, (acc, e) =>
+    if list.contains(acc, e.user_id) then acc else acc + [e.user_id])
+}
+
+// 既存最大 id + 1 (空なら 1)。
+fn next_id(events: List[memory.MemoryEvent]) -> Int =
+  list.fold(events, 0, (acc, e) => if e.id > acc then e.id else acc) + 1

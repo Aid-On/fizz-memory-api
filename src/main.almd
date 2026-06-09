@@ -1,0 +1,121 @@
+// CLI エントリポイント — memory 操作のディスパッチ。
+//
+// 本来の interface は HTTP (POST /note, GET /recall?... 等。ディスパッチ表は
+// mod.almd の `route` に定義) だが、almide の http.serve がハンドラ closure の
+// repr 不一致で build できない (almide/almide#434)。直るまでの間、同じ操作を
+// NDJSON (stdin/stdout) で公開する。route 表と純粋ロジックは transport 非依存で
+// そのまま流用できるので、http.serve が直れば HTTP 化は main の差し替えだけ。
+//
+// stdin: 1 行 1 コマンド (Codec JSON)
+//   {"op":"note","event":{...MemoryEvent...}}      → 追記。{"ok":true,"id":N}
+//   {"op":"recall","user_id":N,"limit":M}          → {"user_id":N,"events":[...]}
+//   {"op":"search","q":"..."}                      → {"q":"...","events":[...]}
+//   {"op":"wipe"}                                  → {"ok":true}
+//   {"op":"users"}                                 → {"users":[id,...]}
+//
+// 実体は l2 と同じ append-only JSONL (FIZZ_MEMORY_PATH、既定 "memory.jsonl")。
+// EOF で終了。不正行は stderr 警告で読み飛ばす。
+
+import self as api
+import fizz_protocol.memory
+import io
+import env
+import json
+import value
+import result
+import list
+import string
+import fs
+
+local fn field(v: Value, k: String) -> Value = value.get(v, k) ?? value.null()
+local fn fstr(v: Value, k: String) -> String = result.unwrap_or(value.as_string(field(v, k)), "")
+local fn fint(v: Value, k: String) -> Int = result.unwrap_or(value.as_int(field(v, k)), 0)
+local fn events_json(evs: List[memory.MemoryEvent]) -> Value =
+  value.array(list.map(evs, (e) => memory.event_encode(e)))
+
+effect fn load_all(path: String) -> Result[List[memory.MemoryEvent], String] = {
+  let empty: List[memory.MemoryEvent] = []
+  if fs.exists(path) then {
+    let lines = fs.read_lines(path)!
+    ok(list.filter_map(lines, (ln) => result.to_option(memory.event_decode(json.parse(ln) ?? value.null()))))
+  } else {
+    ok(empty)
+  }
+}
+
+effect fn handle_note(file: String, ev: memory.MemoryEvent) -> Result[Unit, String] = {
+  let all = load_all(file)!
+  let id = if ev.id > 0 then ev.id else api.next_id(all)
+  let stored = memory.MemoryEvent {
+    id: id, user_id: ev.user_id, session_id: ev.session_id,
+    role: ev.role, content: ev.content, ts: ev.ts, tags: ev.tags,
+  }
+  fs.append(file, json.stringify(memory.event_encode(stored)) + "\n")!
+  println(json.stringify(value.object([("ok", value.bool(true)), ("id", value.int(id))])))
+  ok(())
+}
+
+effect fn handle_recall(file: String, uid: Int, limit: Int) -> Result[Unit, String] = {
+  let all = load_all(file)!
+  println(json.stringify(value.object([
+    ("user_id", value.int(uid)), ("events", events_json(api.recent_of(all, uid, limit))),
+  ])))
+  ok(())
+}
+
+effect fn handle_search(file: String, q: String) -> Result[Unit, String] = {
+  let all = load_all(file)!
+  println(json.stringify(value.object([
+    ("q", value.str(q)), ("events", events_json(api.search(all, q))),
+  ])))
+  ok(())
+}
+
+effect fn handle_wipe(file: String) -> Result[Unit, String] = {
+  if fs.exists(file) then { fs.remove(file)! } else { () }
+  println("{\"ok\":true}")
+  ok(())
+}
+
+effect fn handle_users(file: String) -> Result[Unit, String] = {
+  let all = load_all(file)!
+  println(json.stringify(value.object([
+    ("users", value.array(list.map(api.distinct_users(all), (id) => value.int(id)))),
+  ])))
+  ok(())
+}
+
+effect fn main() -> Unit = {
+  let p = string.trim(env.get("FIZZ_MEMORY_PATH") ?? "")
+  let file = if p == "" then "memory.jsonl" else p
+  var open = true
+  while open {
+    let line = io.read_line()
+    if string.trim(line) == "" then {
+      open = false
+    } else {
+      match json.parse(line) {
+        err(e) => eprintln("[memory-api] bad json: ${e}"),
+        ok(v)  => {
+          let op = fstr(v, "op")
+          if op == "note" then {
+            match memory.event_decode(field(v, "event")) {
+              err(e) => eprintln("[memory-api] bad event: ${e}"),
+              ok(ev) => match handle_note(file, ev) { err(e) => eprintln("[memory-api] ${e}"), ok(_) => () },
+            }
+          } else if op == "recall" then {
+            match handle_recall(file, fint(v, "user_id"), fint(v, "limit")) { err(e) => eprintln("[memory-api] ${e}"), ok(_) => () }
+          } else if op == "search" then {
+            match handle_search(file, fstr(v, "q")) { err(e) => eprintln("[memory-api] ${e}"), ok(_) => () }
+          } else if op == "wipe" then {
+            match handle_wipe(file) { err(e) => eprintln("[memory-api] ${e}"), ok(_) => () }
+          } else if op == "users" then {
+            match handle_users(file) { err(e) => eprintln("[memory-api] ${e}"), ok(_) => () }
+          } else {
+            eprintln("[memory-api] unknown op: ${op}")
+          }
+        },
+      }
+    }
+  }
+}
