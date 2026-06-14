@@ -1,38 +1,34 @@
-// CLI エントリポイント — memory 操作のディスパッチ。
+// CLI エントリポイント — memory 操作の HTTP サーバ。
 //
-// 本来の interface は HTTP (POST /note, GET /recall?... 等。ディスパッチ表は
-// mod.almd の `route` に定義) だが、almide の http.serve がハンドラ closure の
-// repr 不一致で build できない (almide/almide#434)。直るまでの間、同じ操作を
-// NDJSON (stdin/stdout) で公開する。route 表と純粋ロジックは transport 非依存で
-// そのまま流用できるので、http.serve が直れば HTTP 化は main の差し替えだけ。
+//   POST /note            本文に MemoryEvent (JSON) → 追記。{"ok":true,"id":N}
+//   GET  /recall?user_id=N&limit=M  → {"user_id":N,"events":[...]}
+//   GET  /search?q=...    → {"q":"...","events":[...]}
+//   POST /wipe            → {"ok":true}
+//   GET  /users           → {"users":[id,...]}
 //
-// stdin: 1 行 1 コマンド (Codec JSON)
-//   {"op":"note","event":{...MemoryEvent...}}      → 追記。{"ok":true,"id":N}
-//   {"op":"recall","user_id":N,"limit":M}          → {"user_id":N,"events":[...]}
-//   {"op":"search","q":"..."}                      → {"q":"...","events":[...]}
-//   {"op":"wipe"}                                  → {"ok":true}
-//   {"op":"users"}                                 → {"users":[id,...]}
+// 実体のイベントログは l2 と同じ append-only JSONL (FIZZ_MEMORY_PATH、既定
+// "memory.jsonl")。ハンドラはリクエストごとにファイルを読み直す stateless 実装。
+// ポートは FIZZ_MEMORY_PORT (既定 8088)。
 //
-// 実体は l2 と同じ append-only JSONL (FIZZ_MEMORY_PATH、既定 "memory.jsonl")。
-// EOF で終了。不正行は stderr 警告で読み飛ばす。
+// ディスパッチ表 (route) とフィルタ/集計ロジックは mod.almd (transport 非依存)。
 
 import self as api
 import fizz_protocol.memory
-import io
+import http
+import fs
 import env
 import json
 import value
 import result
 import list
 import string
-import fs
+import map
+import int
 
-local fn field(v: Value, k: String) -> Value = value.get(v, k) ?? value.null()
-local fn fstr(v: Value, k: String) -> String = result.unwrap_or(value.as_string(field(v, k)), "")
-local fn fint(v: Value, k: String) -> Int = result.unwrap_or(value.as_int(field(v, k)), 0)
 local fn events_json(evs: List[memory.MemoryEvent]) -> Value =
   value.array(list.map(evs, (e) => memory.event_encode(e)))
 
+// ファイルから全イベントを読む (無ければ空)。壊れた行は読み飛ばす。
 effect fn load_all(path: String) -> Result[List[memory.MemoryEvent], String] = {
   let empty: List[memory.MemoryEvent] = []
   if fs.exists(path) then {
@@ -43,79 +39,87 @@ effect fn load_all(path: String) -> Result[List[memory.MemoryEvent], String] = {
   }
 }
 
-effect fn handle_note(file: String, ev: memory.MemoryEvent) -> Result[Unit, String] = {
-  let all = load_all(file)!
-  let id = if ev.id > 0 then ev.id else api.next_id(all)
-  let stored = memory.MemoryEvent {
-    id: id, user_id: ev.user_id, session_id: ev.session_id,
-    role: ev.role, content: ev.content, ts: ev.ts, tags: ev.tags,
+effect fn handle_note(file: String, body: String) -> Result[HttpResponse, String] = {
+  match memory.event_decode(json.parse(body) ?? value.null()) {
+    err(e) => ok(http.response(400, json.stringify(value.object([("error", value.str("bad event: ${e}"))])))),
+    ok(ev) => {
+      let all = load_all(file)!
+      let id = if ev.id > 0 then ev.id else api.next_id(all)
+      let stored = memory.MemoryEvent {
+        id: id, user_id: ev.user_id, session_id: ev.session_id,
+        role: ev.role, content: ev.content, ts: ev.ts, tags: ev.tags,
+      }
+      fs.append(file, json.stringify(memory.event_encode(stored)) + "\n")!
+      ok(http.json(200, json.stringify(value.object([
+        ("ok", value.bool(true)), ("id", value.int(id)),
+      ]))))
+    },
   }
-  fs.append(file, json.stringify(memory.event_encode(stored)) + "\n")!
-  println(json.stringify(value.object([("ok", value.bool(true)), ("id", value.int(id))])))
-  ok(())
 }
 
-effect fn handle_recall(file: String, uid: Int, limit: Int) -> Result[Unit, String] = {
+effect fn handle_recall(file: String, req: HttpRequest) -> Result[HttpResponse, String] = {
+  let params = http.query_params(req)
+  let uid = match int.parse(map.get_or(params, "user_id", "0")) { ok(n) => n, err(_) => 0 }
+  let limit = match int.parse(map.get_or(params, "limit", "0")) { ok(n) => n, err(_) => 0 }
   let all = load_all(file)!
-  println(json.stringify(value.object([
+  ok(http.json(200, json.stringify(value.object([
     ("user_id", value.int(uid)), ("events", events_json(api.recent_of(all, uid, limit))),
-  ])))
-  ok(())
+  ]))))
 }
 
-effect fn handle_search(file: String, q: String) -> Result[Unit, String] = {
+effect fn handle_search(file: String, req: HttpRequest) -> Result[HttpResponse, String] = {
+  let params = http.query_params(req)
+  // query_params は URL デコードしない (almide#684) ので自前で復号する。
+  let q = api.url_decode(map.get_or(params, "q", ""))
   let all = load_all(file)!
-  println(json.stringify(value.object([
+  ok(http.json(200, json.stringify(value.object([
     ("q", value.str(q)), ("events", events_json(api.search(all, q))),
-  ])))
-  ok(())
+  ]))))
 }
 
-effect fn handle_wipe(file: String) -> Result[Unit, String] = {
+effect fn handle_wipe(file: String) -> Result[HttpResponse, String] = {
   if fs.exists(file) then { fs.remove(file)! } else { () }
-  println("{\"ok\":true}")
-  ok(())
+  ok(http.json(200, "{\"ok\":true}"))
 }
 
-effect fn handle_users(file: String) -> Result[Unit, String] = {
+effect fn handle_users(file: String) -> Result[HttpResponse, String] = {
   let all = load_all(file)!
-  println(json.stringify(value.object([
+  ok(http.json(200, json.stringify(value.object([
     ("users", value.array(list.map(api.distinct_users(all), (id) => value.int(id)))),
-  ])))
-  ok(())
+  ]))))
+}
+
+// ログファイルのパスを env から解決する (ハンドラはローカルを捕獲しない設計)。
+effect fn current_file() -> String = {
+  let p = string.trim(env.get("FIZZ_MEMORY_PATH") ?? "")
+  if p == "" then "memory.jsonl" else p
+}
+
+// ハンドラ本体。method+path を mod.route で振り分け、Result を返す。
+effect fn dispatch(req: HttpRequest) -> Result[HttpResponse, String] = {
+  let file = current_file()
+  let method = http.req_method(req)
+  let path = api.clean_path(http.req_path(req))
+  match api.route(method, path) {
+    Note     => handle_note(file, http.req_body(req)),
+    Recall   => handle_recall(file, req),
+    Search   => handle_search(file, req),
+    Wipe     => handle_wipe(file),
+    Users    => handle_users(file),
+    NotFound => ok(http.response(404, "{\"error\":\"not found\"}")),
+  }
 }
 
 effect fn main() -> Unit = {
-  let p = string.trim(env.get("FIZZ_MEMORY_PATH") ?? "")
-  let file = if p == "" then "memory.jsonl" else p
-  var open = true
-  while open {
-    let line = io.read_line()
-    if string.trim(line) == "" then {
-      open = false
-    } else {
-      match json.parse(line) {
-        err(e) => eprintln("[memory-api] bad json: ${e}"),
-        ok(v)  => {
-          let op = fstr(v, "op")
-          if op == "note" then {
-            match memory.event_decode(field(v, "event")) {
-              err(e) => eprintln("[memory-api] bad event: ${e}"),
-              ok(ev) => match handle_note(file, ev) { err(e) => eprintln("[memory-api] ${e}"), ok(_) => () },
-            }
-          } else if op == "recall" then {
-            match handle_recall(file, fint(v, "user_id"), fint(v, "limit")) { err(e) => eprintln("[memory-api] ${e}"), ok(_) => () }
-          } else if op == "search" then {
-            match handle_search(file, fstr(v, "q")) { err(e) => eprintln("[memory-api] ${e}"), ok(_) => () }
-          } else if op == "wipe" then {
-            match handle_wipe(file) { err(e) => eprintln("[memory-api] ${e}"), ok(_) => () }
-          } else if op == "users" then {
-            match handle_users(file) { err(e) => eprintln("[memory-api] ${e}"), ok(_) => () }
-          } else {
-            eprintln("[memory-api] unknown op: ${op}")
-          }
-        },
-      }
-    }
+  let port = match int.parse(string.trim(env.get("FIZZ_MEMORY_PORT") ?? "")) {
+    ok(n)  => n,
+    err(_) => 8088,
   }
+  println("[memory-api] listening on http://localhost:${int.to_string(port)} (log: ${current_file()})")
+  http.serve(port, (req) => {
+    match dispatch(req) {
+      ok(resp) => resp,
+      err(e)   => http.response(500, json.stringify(value.object([("error", value.str(e))]))),
+    }
+  })
 }

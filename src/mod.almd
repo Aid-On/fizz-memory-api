@@ -66,3 +66,35 @@ fn distinct_users(events: List[memory.MemoryEvent]) -> List[Int] = {
 // 既存最大 id + 1 (空なら 1)。
 fn next_id(events: List[memory.MemoryEvent]) -> Int =
   list.fold(events, 0, (acc, e) => if e.id > acc then e.id else acc) + 1
+
+// パーセントエンコードされたクエリ値をデコードする (%XX → byte, + → space)。
+// almide の http.query_params が URL デコードしない (almide/almide#684) ため、
+// /search?q=猫 のような非ASCII クエリを正しく扱えるようここで補う。
+local fn hex_val(c: Int) -> Int =
+  if c >= 48 and c <= 57 then c - 48        // '0'-'9'
+  else if c >= 65 and c <= 70 then c - 55   // 'A'-'F'
+  else if c >= 97 and c <= 102 then c - 87  // 'a'-'f'
+  else -1
+
+local fn decode_bytes(src: List[Int], i: Int, acc: List[Int]) -> List[Int] = {
+  let n = list.len(src)
+  if i >= n then acc
+  else {
+    let b = list.get(src, i) ?? 0
+    if b == 37 and i + 2 < n then {   // '%'
+      let h1 = hex_val(list.get(src, i + 1) ?? 0)
+      let h2 = hex_val(list.get(src, i + 2) ?? 0)
+      if h1 >= 0 and h2 >= 0 then decode_bytes(src, i + 3, acc + [h1 * 16 + h2])
+      else decode_bytes(src, i + 1, acc + [b])   // 不正な %XX は素通し
+    } else if b == 43 then            // '+' → space (form encoding)
+      decode_bytes(src, i + 1, acc + [32])
+    else
+      decode_bytes(src, i + 1, acc + [b])
+  }
+}
+
+// バイト列を再構成して UTF-8 文字列に戻す。
+fn url_decode(s: String) -> String = {
+  let seed: List[Int] = []
+  string.from_bytes(decode_bytes(string.to_bytes(s), 0, seed))
+}

@@ -49,6 +49,14 @@ test "distinct_users lists each user once, in first-seen order" {
   assert_eq(list.first(us) ?? 0, 7)
 }
 
+test "url_decode handles percent-encoding (incl. multibyte) and +" {
+  assert_eq(api.url_decode("%E7%8C%AB"), "猫")            // 3-byte UTF-8
+  assert_eq(api.url_decode("hello+world"), "hello world") // + → space
+  assert_eq(api.url_decode("plain"), "plain")             // no-op
+  assert_eq(api.url_decode("%2F"), "/")                   // ASCII
+  assert_eq(api.url_decode("a%E7%8C%ABb"), "a猫b")        // mixed
+}
+
 test "next_id is max id + 1" {
   let empty: List[memory.MemoryEvent] = []
   assert_eq(api.next_id(empty), 1)
